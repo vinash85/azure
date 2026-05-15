@@ -1,6 +1,7 @@
 """
 End-to-end supervised fine-tuning of DermLIP on HAM10000 (7-class classification).
 - Distributed via PyTorch DDP across N nodes x G GPUs.
+- Auto-detects single-process mode for local smoke testing (no DDP/NCCL).
 - Saves per-epoch checkpoints + best-by-balanced-accuracy.
 - Auto-resumes from latest checkpoint on restart (spot-preemption safe).
 """
@@ -29,28 +30,23 @@ import open_clip
 # ----------------------- Args -----------------------
 def parse_args():
     p = argparse.ArgumentParser()
-    # Data
-    p.add_argument("--data", type=str, required=True, help="HAM10000 root (mounted)")
+    p.add_argument("--data", type=str, required=True)
     p.add_argument("--metadata-csv", type=str, default="HAM10000_metadata.csv")
     p.add_argument("--image-subdirs", nargs="+",
                    default=["HAM10000_images_part_1", "HAM10000_images_part_2"])
     p.add_argument("--val-frac", type=float, default=0.15)
-    # Model
     p.add_argument("--model-name", type=str, default="hf-hub:redlessone/DermLIP_ViT-B-16")
     p.add_argument("--finetune-mode", choices=["full", "linear", "lora"], default="full")
     p.add_argument("--lora-rank", type=int, default=8)
-    # Training
     p.add_argument("--epochs", type=int, default=20)
-    p.add_argument("--batch-size", type=int, default=64, help="Per-GPU batch size")
+    p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.05)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument("--seed", type=int, default=42)
-    # Distributed (informational only - DDP reads env vars itself)
     p.add_argument("--nodes", type=int, default=int(os.environ.get("AZUREML_NODE_COUNT", "1")))
     p.add_argument("--gpus-per-node", type=int, default=torch.cuda.device_count())
-    # Output
     p.add_argument("--output-dir", type=str, default="./outputs")
     return p.parse_args()
 
@@ -113,17 +109,20 @@ def build_model(model_name, num_classes, mode, lora_rank):
             target_modules=["qkv", "proj"], bias="none",
         )
         visual = get_peft_model(visual, cfg)
-    # "full" -> leave all trainable
-
     return DermLIPClassifier(visual, embed_dim, num_classes), preprocess
 
 
 # ----------------------- Distributed helpers -----------------------
 def setup_ddp():
+    """Returns (local_rank, rank, world_size, distributed)."""
+    if int(os.environ.get("WORLD_SIZE", "1")) == 1:
+        if torch.cuda.is_available():
+            torch.cuda.set_device(0)
+        return 0, 0, 1, False
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
-    return local_rank, int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
+    return local_rank, int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"]), True
 
 
 def is_main():
@@ -143,7 +142,7 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, criterion, devi
         imgs = imgs.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             loss = criterion(model(imgs), labels)
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -158,12 +157,12 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, criterion, devi
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, world_size):
+def evaluate(model, loader, device, world_size, distributed):
     model.eval()
     preds, labs = [], []
     for imgs, labels in loader:
         imgs = imgs.to(device, non_blocking=True)
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             logits = model(imgs)
         preds.append(logits.argmax(1).cpu())
         labs.append(labels)
@@ -173,18 +172,20 @@ def evaluate(model, loader, device, world_size):
     bal = balanced_accuracy_score(labs, preds)
     f1 = f1_score(labs, preds, average="macro")
 
-    # Average metrics across ranks
-    t = torch.tensor([acc, bal, f1], device=device, dtype=torch.float64)
-    dist.all_reduce(t, op=dist.ReduceOp.SUM)
-    t /= world_size
-    return t[0].item(), t[1].item(), t[2].item()
+    if distributed:
+        t = torch.tensor([acc, bal, f1], device=device, dtype=torch.float64)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        t /= world_size
+        return t[0].item(), t[1].item(), t[2].item()
+    return acc, bal, f1
 
 
 # ----------------------- Checkpointing -----------------------
-def save_ckpt(path, epoch, model, optimizer, scheduler, scaler, best_bal_acc, args):
+def save_ckpt(path, epoch, model, optimizer, scheduler, scaler, best_bal_acc, args, distributed):
+    state = model.module.state_dict() if distributed else model.state_dict()
     torch.save({
         "epoch": epoch,
-        "model": model.module.state_dict(),
+        "model": state,
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict(),
@@ -193,14 +194,15 @@ def save_ckpt(path, epoch, model, optimizer, scheduler, scaler, best_bal_acc, ar
     }, path)
 
 
-def maybe_resume(out_dir, model, optimizer, scheduler, scaler, local_rank):
+def maybe_resume(out_dir, model, optimizer, scheduler, scaler, local_rank, distributed):
     ckpt_path = out_dir / "latest.pt"
     if not ckpt_path.exists():
         return 0, 0.0
     log(f"[resume] loading {ckpt_path}")
-    map_location = {"cuda:0": f"cuda:{local_rank}"}
+    map_location = {"cuda:0": f"cuda:{local_rank}"} if torch.cuda.is_available() else "cpu"
     ckpt = torch.load(ckpt_path, map_location=map_location)
-    model.module.load_state_dict(ckpt["model"])
+    target = model.module if distributed else model
+    target.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
     scaler.load_state_dict(ckpt["scaler"])
@@ -215,14 +217,15 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed)
 
-    local_rank, rank, world_size = setup_ddp()
-    device = torch.device("cuda", local_rank)
+    local_rank, rank, world_size, distributed = setup_ddp()
+    device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
+
     out_dir = Path(args.output_dir)
     if is_main():
         out_dir.mkdir(parents=True, exist_ok=True)
 
     log(f"[setup] nodes={args.nodes} gpus_per_node={args.gpus_per_node} "
-        f"world_size={world_size} mode={args.finetune_mode}")
+        f"world_size={world_size} distributed={distributed} mode={args.finetune_mode} device={device}")
 
     # --- Data ---
     df = pd.read_csv(Path(args.data) / args.metadata_csv)
@@ -239,7 +242,8 @@ def main():
         mode=args.finetune_mode, lora_rank=args.lora_rank,
     )
     model = model.to(device)
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+    if distributed:
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     # --- Transforms ---
     train_tf = transforms.Compose([
@@ -247,31 +251,34 @@ def main():
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
         transforms.ColorJitter(0.2, 0.2, 0.2),
-        preprocess.transforms[-2],   # ToTensor
-        preprocess.transforms[-1],   # Normalize
+        preprocess.transforms[-2],
+        preprocess.transforms[-1],
     ])
     val_tf = preprocess
 
     train_ds = HAM10000(train_df, image_index, train_tf)
     val_ds = HAM10000(val_df, image_index, val_tf)
 
-    train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
-    val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False)
-
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, sampler=train_sampler,
-        num_workers=args.num_workers, pin_memory=True, drop_last=True,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, sampler=val_sampler,
-        num_workers=args.num_workers, pin_memory=True,
-    )
+    if distributed:
+        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
+        val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False)
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler,
+                                  num_workers=args.num_workers, pin_memory=True, drop_last=True)
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size, sampler=val_sampler,
+                                num_workers=args.num_workers, pin_memory=True)
+    else:
+        train_sampler = None
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                                  num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
+                                  drop_last=True)
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                                num_workers=args.num_workers, pin_memory=(device.type == "cuda"))
 
     # --- Optim / Loss ---
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs * len(train_loader))
-    scaler = torch.amp.GradScaler("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
     class_counts = train_df["dx"].value_counts().reindex(HAM_CLASSES).values
     class_weights = torch.tensor(
@@ -282,38 +289,38 @@ def main():
 
     # --- Resume if possible ---
     start_epoch, best_bal_acc = maybe_resume(
-        out_dir, model, optimizer, scheduler, scaler, local_rank
+        out_dir, model, optimizer, scheduler, scaler, local_rank, distributed
     )
 
     # --- Train loop ---
     for epoch in range(start_epoch, args.epochs):
-        train_sampler.set_epoch(epoch)
+        if distributed:
+            train_sampler.set_epoch(epoch)
         train_loss = train_one_epoch(
             model, train_loader, optimizer, scheduler, scaler, criterion, device, epoch
         )
-        val_acc, val_bal, val_f1 = evaluate(model, val_loader, device, world_size)
+        val_acc, val_bal, val_f1 = evaluate(model, val_loader, device, world_size, distributed)
 
         log(f"[epoch {epoch}] train_loss={train_loss:.4f} "
             f"val_acc={val_acc:.4f} val_bal_acc={val_bal:.4f} val_macro_f1={val_f1:.4f}")
 
         if is_main():
-            # Save latest every epoch (preemption recovery)
             save_ckpt(out_dir / "latest.pt", epoch, model, optimizer, scheduler,
-                      scaler, max(best_bal_acc, val_bal), args)
-            # Save best by balanced accuracy
+                      scaler, max(best_bal_acc, val_bal), args, distributed)
             if val_bal > best_bal_acc:
                 best_bal_acc = val_bal
                 save_ckpt(out_dir / "best.pt", epoch, model, optimizer, scheduler,
-                          scaler, best_bal_acc, args)
+                          scaler, best_bal_acc, args, distributed)
                 with open(out_dir / "best_metrics.json", "w") as f:
-                    json.dump({
-                        "epoch": epoch, "val_acc": val_acc,
-                        "val_bal_acc": val_bal, "val_macro_f1": val_f1,
-                    }, f, indent=2)
-        dist.barrier()   # keep ranks aligned across save
+                    json.dump({"epoch": epoch, "val_acc": val_acc,
+                               "val_bal_acc": val_bal, "val_macro_f1": val_f1}, f, indent=2)
+
+        if distributed:
+            dist.barrier()
 
     log(f"[done] best balanced acc = {best_bal_acc:.4f}")
-    dist.destroy_process_group()
+    if distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

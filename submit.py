@@ -2,10 +2,11 @@
 Submits the DermLIP HAM10000 fine-tuning job to Azure ML.
 Distributed: NODES x GPUS_PER_NODE ranks.
 Checkpoints are written directly to blob storage (preemption-safe).
+Uses a custom environment built from conda.yaml on top of ACPT PyTorch.
 """
 from azure.ai.ml import Input, MLClient, Output, command
 from azure.ai.ml.constants import AssetTypes, InputOutputModes
-from azure.ai.ml.entities import PyTorchDistribution
+from azure.ai.ml.entities import Environment, PyTorchDistribution
 from azure.identity import DefaultAzureCredential
 
 # --- Workspace ---
@@ -27,19 +28,23 @@ FINETUNE_MODE = "full"          # "full" | "linear" | "lora"
 MODEL_NAME = "hf-hub:redlessone/DermLIP_ViT-B-16"
 
 DATA_ASSET = "azureml:ham10k:1"
-CKPT_PATH = "azureml://datastores/workspaceblobstore/paths/checkpoints/dermlip-ham10000/"
+CKPT_PATH = "azureml://datastores/workspaceblobstore/paths/checkpoints/dermlip-ham10k/"
 COMPUTE = "trailsft"
 
-# --- Install extras on top of curated ACPT PyTorch image ---
-PIP_INSTALL = (
-    "pip install --quiet open_clip_torch peft scikit-learn pandas Pillow && "
+# --- Custom environment: ACPT PyTorch base + conda.yaml extras ---
+custom_env = Environment(
+    name="dermlip-env",
+    description="DermLIP fine-tuning env on top of ACPT PyTorch 2.8 CUDA 12.6",
+    conda_file="./conda.yaml",
+    image="mcr.microsoft.com/azureml/curated/acpt-pytorch-2.8-cuda12.6:latest",
 )
+custom_env = ml_client.environments.create_or_update(custom_env)
+print(f"Environment registered: {custom_env.name}:{custom_env.version}")
 
 # --- Build job ---
 job = command(
     code="./",
     command=(
-        PIP_INSTALL +
         "python train.py "
         "--data ${{inputs.training_data}} "
         "--output-dir ${{outputs.checkpoints}} "
@@ -66,12 +71,12 @@ job = command(
             mode=InputOutputModes.RW_MOUNT,
         ),
     },
-    environment="azureml://registries/azureml/environments/acpt-pytorch-2.2-cuda12.1/labels/latest",
+    environment=custom_env,
     compute=COMPUTE,
     instance_count=NODES,
     distribution=PyTorchDistribution(process_count_per_instance=GPUS_PER_NODE),
-    display_name="dermlip-ham10000-ft",
-    experiment_name="dermlip-ham10000",
+    display_name="dermlip-ham10k-ft",
+    experiment_name="dermlip-ham10k",
 )
 
 returned = ml_client.jobs.create_or_update(job)
