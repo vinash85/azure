@@ -1,0 +1,12 @@
+name: dermlip
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+    - open_clip_torch==3.3.0
+    - peft==0.19.1
+    - scikit-learn==1.7.2
+    - pandas==2.3.3
+    - Pillow==12.2.0
