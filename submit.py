@@ -4,9 +4,9 @@ Distributed: NODES x GPUS_PER_NODE ranks.
 Checkpoints are written directly to blob storage (preemption-safe).
 Uses a custom environment built from conda.yaml on top of ACPT PyTorch.
 """
-from azure.ai.ml import Input, MLClient, Output, command
+from azure.ai.ml import Input, MLClient, Output, command, PyTorchDistribution
 from azure.ai.ml.constants import AssetTypes, InputOutputModes
-from azure.ai.ml.entities import Environment, PyTorchDistribution
+from azure.ai.ml.entities import Environment
 from azure.identity import DefaultAzureCredential
 
 # --- Workspace ---
