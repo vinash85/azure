@@ -5,6 +5,16 @@ A practical, distilled walkthrough from a fresh Azure subscription to a running 
 > **Reality check on authentication:** Many enterprise Azure tenants block device-code logins (`az login --use-device-code`, `azcopy login`) via Conditional Access policies. If that's your situation, you'll authenticate by other means — **SAS tokens for data upload**, and a **compute instance with managed identity for job submission**. This guide covers both the happy path and the workarounds.
 
 ---
+## Video Links:
+- All video series: [Full video](https://drive.google.com/drive/folders/1h4Sy1yrMCmXdbAWB5jZDO2nHyTj12y-Q?usp=sharing)
+- [0 Intro](https://drive.google.com/file/d/1LtGpahFcrrn3KM6YDGLReejE3c3CIjXQ/view?usp=sharing)
+- [1 Create Workspace](https://drive.google.com/file/d/1obqniTMIFLF64jCTCqOH4g9I9Ns5oI-a/view?usp=drive_link)
+- [2.1 Data Loading into Azure](https://drive.google.com/file/d/1e6Pnqn09rsJMOfKzNuEQOBVN_ft-4eZv/view?usp=drive_link)
+- [2.2 Creating asset/ data path](https://drive.google.com/file/d/1Vmt-GwyQb7H_9qDzdroFrlJJhzE4KC5r/view?usp=drive_link)
+- [3 Create Cluster and VLM](https://drive.google.com/file/d/1d-tmeAZ2ToZRGqiMHqAK1z_qDDBwqkFX/view?usp=drive_link)
+- [4 Code and Dry Run](https://drive.google.com/file/d/1dWCxpDopUByPu7WxnZZcvKkmgWOVjrC6/view?usp=drive_link)
+- [5 Launch Cluster from Instance VM](https://drive.google.com/file/d/1Oo-zz5Os_duXlS2Sv-oLr3S2kieD1-wh/view?usp=drive_link)
+- [6 Monitoring](https://drive.google.com/file/d/1y7VyYO1iJ2ZP65E7P5OGOa1H2fZZSgOT/view?usp=drive_link)
 
 ## Phase 1 — Foundations (one-time setup)
 
